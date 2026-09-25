@@ -44,6 +44,7 @@
 | 12 | 遗忘 | 三档：排序衰减 / 归档 / 硬删除 | 单一"删除"策略（要么丢数据，要么无法真正删除） |
 | 13 | 删除失败 | `forget()` **绝不降级**，失败即抛并重试 | 记日志后继续（删除没有"部分成功"，遗留数据即隐私事故） |
 | 14 | 作用域缺失 | **fail fast** 抛 `ScopeError` | 默认放行查全库（一旦漏传 `scope` 就是泄露） |
+| 15 | 日志 | 归忆直接依赖 **loguru**，遵循本体 formatter 的字段约定（`fields` / `face`），既不 import 本体也不自定义 Logger 抽象 | 自定义 `Logger` 协议回调（多一层无谓抽象，日志格式与本体两张皮）；import 本体 `core.logger`（循环依赖，不可行） |
 
 ---
 
@@ -65,11 +66,12 @@ guiyi/
 
 **依赖方向**：单向 `api → {retrieve, extract, forget} → store → schema`。子模块之间不横向引用（`retrieve` 不 import `extract`），保证各自可独立测试。
 
-**三条硬约束**
+**四条硬约束**
 
 1. **不 import 本体任何模块**，也不继承 `core.service.Service`——避免循环依赖。
 2. **外部依赖全部经协议注入**：`Embedder`、`Extractor`、`LlmClient` 均为 `Protocol`；v1 实现是 ONNX、LLM 抽取、DeepSeek 客户端。测试可注入假实现，换模型不改上层。
 3. **不引入 web 框架**。`MemoryEngine` 是纯 Python 对象。
+4. **日志直接用 loguru**，不自定义日志抽象。按本体字段约定 `logger.bind(fields=..., face=...)` 输出，因此自动进入本体的 sink 与 formatter，格式完全一致（详见 6.3）。
 
 **唯一门面**：`MemoryEngine` 暴露四个方法——`remember()`、`recall()`、`forget()`、`consolidate()`。本体侧适配层只做转发。
 
@@ -186,7 +188,26 @@ GuiyiError
 
 ### 6.3 日志
 
-归忆**不打印日志到 stdout**，也不依赖本体的 loguru。引擎通过注入的 `Logger` 协议回调上报（默认可传 `None` 静默），由本体适配层桥接到本体的 `log`。这样归忆不绑定任何日志框架。
+**归忆直接依赖 loguru，遵循本体的字段约定**——不自定义日志抽象，也不 import 本体。
+
+- 统一走 `logger.bind(face=..., fields={...}).log(level, message)`，这正是本体 `Log._emit` 的约定。
+- 于是归忆日志**自动进入本体的全部 sink**：loguru 在进程内是单例，本体 `setup_logging()` 装配一次即可。树形 / JSON 格式、颜文字、按天轮转全部复用，**零适配代码**。
+- `face` 可省略：本体 formatter 会按级别取默认颜文字（见 `core/logger/formatters.py` 的 `_pick_face`）。
+
+**`request_id` 的贯通**：本体的 `request_id` 存在 `ContextVar` 中，且是本体门面**主动 merge 进 `fields`** 的；归忆不 import 本体，因此读不到它。解决办法是一个**模块级上下文钩子**——本体适配层在 `start()` 注册一次：
+
+```python
+# 本体侧
+guiyi.log_context.register(core.logger.context.current)
+```
+
+```python
+# 归忆侧：输出前合并外部上下文，全库仅此一处感知外部
+fields = {**_context_provider(), **own_fields}
+logger.bind(face=face, fields=fields).log(level, message)
+```
+
+这只是一行注册，不是日志抽象——日志本身完全走 loguru。若本体选择不注册，归忆日志仅缺 `request_id` 一个字段，业务字段（`scope`、`session`）仍然完整。
 
 ---
 
@@ -228,15 +249,16 @@ GuiyiError
 | `pyproject.toml` | 加归忆依赖（开发期用 uv path 依赖指向本仓库） |
 | `core/config/settings.py` | `Settings` 增顶层字段 `memory: MemorySettings` |
 | `core/config/__init__.py` | 导出 `MemorySettings` |
-| `core/service/memory_service.py` | 新增 `MemoryService(Service)`：构造器接 `MemorySettings` + `ClockService`；`start()` 建表与预热 Embedder；`stop()` 关连接；方法转发给引擎 |
+| `core/service/memory_service.py` | 新增 `MemoryService(Service)`：构造器接 `MemorySettings` + `ClockService`；`start()` 建表、预热 Embedder、注册日志上下文钩子；`stop()` 关连接；方法转发给引擎 |
 | `core/service/registry.py` | `register(MemoryService)` |
 | `data/config/app.yaml` | 补 `memory:` 段 |
 
 ### 8.3 契约约束
 
 - `MemoryEngine` 的方法**必须显式接收 `scope` 与时间**，不读任何隐式全局状态。
-- 归忆不打印日志、不抛框架异常，只用自己的异常层次。
+- 归忆只用 loguru 输出日志（遵循本体字段约定），不抛框架异常，异常只用 `GuiyiError` 层次。
 - 归忆**不反向依赖**本体，也不持有任何密钥。API key 由本体注入。
+- 本体适配层在 `start()` 里调 `guiyi.log_context.register(core.logger.context.current)`，以贯通 `request_id`。
 
 ---
 
@@ -261,7 +283,7 @@ GuiyiError
 
 ### 9.2 依赖清单
 
-- 运行时：`pydantic>=2`、`numpy`、`onnxruntime`
+- 运行时：`pydantic>=2`、`numpy`、`onnxruntime`、`loguru>=0.7`（与本体对齐）
 - 可选（v2）：`sqlite-vec`
 - 开发：`pytest`、`ruff`、`basedpyright`
 - **明确不引入**：torch、langchain、任何 web 框架、任何向量数据库 SDK
@@ -291,7 +313,8 @@ GuiyiError
 4. `forget()` 后五张表零残留（自动化断言）。
 5. 10 万条记忆下单次 `recall()` P95 < 100ms（CPU）。
 6. 抽取失败不影响对话，且原文可离线重抽。
-7. `uv run pytest` 全绿；`uv run ruff check .` 与 `basedpyright` 零告警。
+7. 归忆日志出现在本体 `logs/app.log` 中，树形格式与本体一致，且带 `scope` 等业务字段。
+8. `uv run pytest` 全绿；`uv run ruff check .` 与 `basedpyright` 零告警。
 
 ---
 
@@ -299,7 +322,7 @@ GuiyiError
 
 | 阶段 | 内容 | 出口条件 |
 | --- | --- | --- |
-| **v1** | SQLite 五表 + 作用域强制 + 混合检索（向量 + BM25）+ 情景/语义两轨 + 并发抽取 + 降级路径 | 验收标准 1–7 通过 |
+| **v1** | SQLite 五表 + 作用域强制 + 混合检索（向量 + BM25）+ 情景/语义两轨 + 并发抽取 + 降级路径 | 验收标准 1–8 通过 |
 | **v2** | 情感与程序性两轨 + 离线巩固 + 实体消解 | 情感状态能稳定更新；聚类提炼不产生明显噪声 |
 | **v3** | 实体图多跳检索 + `sqlite-vec` 向量索引 + Vulkan/llama.cpp 升级 bge-m3 | 图检索在多跳问题上优于混合检索基线 |
 
