@@ -20,7 +20,8 @@
 **非目标（本版不做）**
 
 - 不提供 HTTP / RPC 层——若将来要独立部署，由使用方自行包一层。
-- 不做实体图多跳检索（v2 规划）。
+- 不做关系图多跳检索（v2/v3 规划）。
+- v1 不接入 Jev 等外部 System One 模型（评估见 12.2）。
 - 不做多模态记忆（图片、语音）。
 - 不做跨用户共享记忆（除群记忆这一层）。
 
@@ -38,13 +39,15 @@
 | 6 | 写入机制 | 两层：原文全量 + LLM 实时派生 | 只存抽取结果（不可恢复）；实时 vs 异步的选择见 #7 |
 | 7 | 实时抽取实现 | **并发抽取、回复不等**，原文先落库 | 串行叠在回复链路（响应从约 1s 拉到约 3s）；单次调用双输出（把"怎么撩"与"记什么"耦合，难调） |
 | 8 | 作用域 | 三层：个人 / 群 / Aliya 自我 | 严格单用户（无法被拉群）；不分层（群内会泄露个人隐私） |
-| 9 | 检索 | 混合检索（向量 + BM25 + 结构化过滤）+ RRF + 重排 + 类型配额 | 纯向量（专有名词区分度差）；v1 上实体图（依赖实体消解质量，先做对再开） |
+| 9 | 检索 | 混合检索（向量 + BM25 + 结构化过滤）+ RRF + 重排 + 类型配额 | 纯向量（专有名词区分度差）；v1 上关系图（依赖实体消解质量，先做对再开） |
 | 10 | 四轨存储形态 | **单表** + `payload` JSON | 四张表（跨类型召回与统一排序复杂，向量索引要维护四份） |
 | 11 | 矛盾事实 | supersede 链，旧值保留 | 直接覆盖（丢失"你以前喜欢 X"这类有价值的历史） |
 | 12 | 遗忘 | 三档：排序衰减 / 归档 / 硬删除 | 单一"删除"策略（要么丢数据，要么无法真正删除） |
 | 13 | 删除失败 | `forget()` **绝不降级**，失败即抛并重试 | 记日志后继续（删除没有"部分成功"，遗留数据即隐私事故） |
 | 14 | 作用域缺失 | **fail fast** 抛 `ScopeError` | 默认放行查全库（一旦漏传 `scope` 就是泄露） |
 | 15 | 日志 | 归忆直接依赖 **loguru**，遵循本体 formatter 的字段约定（`fields` / `face`），既不 import 本体也不自定义 Logger 抽象 | 自定义 `Logger` 协议回调（多一层无谓抽象，日志格式与本体两张皮）；import 本体 `core.logger`（循环依赖，不可行） |
+| 16 | 高频窄判断 | 抽象出 **`Judge` 协议**，v1 用规则/阈值实现；Jev 这类 System One 模型留到 v2 作为其实现 | 直接依赖 Jev（中文准确率未验证、每轮出网、供应商仅两周新）；把判断逻辑散落在各调用点（无法替换、无法单测） |
+| 17 | 关系类型 | 四类：语义 / 时间 / **因果** / 实体，v1 写入不检索 | 只做实体关系（丢掉因果链，且因果**无法事后回填**）；v1 就上关系检索（依赖实体消解质量） |
 
 ---
 
@@ -59,17 +62,18 @@ guiyi/
   store/          # SQLite 建表与迁移、DAO、FtsIndex(FTS5)、VectorIndex 协议及实现
   embed/          # Embedder 协议 + OnnxEmbedder(v1) + NullEmbedder(降级)
   extract/        # Extractor 协议 + LlmExtractor（四轨结构化抽取）
+  judge/          # Judge 协议：高频窄判断（门控/去重/打分/实体消解）
   retrieve/       # 三路召回 + RRF 融合 + 重排 + token 配额组装
   forget/         # 衰减、巩固、作用域删除
   errors.py       # 异常层次
 ```
 
-**依赖方向**：单向 `api → {retrieve, extract, forget} → store → schema`。子模块之间不横向引用（`retrieve` 不 import `extract`），保证各自可独立测试。
+**依赖方向**：单向 `api → {retrieve, extract, judge, forget} → store → schema`。子模块之间不横向引用（`retrieve` 不 import `extract`），`judge` 由 `extract` / `retrieve` / `forget` 各自依赖，保证各自可独立测试。
 
 **四条硬约束**
 
 1. **不 import 本体任何模块**，也不继承 `core.service.Service`——避免循环依赖。
-2. **外部依赖全部经协议注入**：`Embedder`、`Extractor`、`LlmClient` 均为 `Protocol`；v1 实现是 ONNX、LLM 抽取、DeepSeek 客户端。测试可注入假实现，换模型不改上层。
+2. **外部依赖全部经协议注入**：`Embedder`、`Extractor`、`Judge`、`LlmClient` 均为 `Protocol`；v1 实现是 ONNX、LLM 抽取、规则判断、DeepSeek 客户端。测试可注入假实现，换模型不改上层。
 3. **不引入 web 框架**。`MemoryEngine` 是纯 Python 对象。
 4. **日志直接用 loguru**，不自定义日志抽象。按本体字段约定 `logger.bind(fields=..., face=...)` 输出，因此自动进入本体的 sink 与 formatter，格式完全一致（详见 6.3）。
 
@@ -79,14 +83,17 @@ guiyi/
 
 ## 四、数据模型
 
-**五张表，四轨统一存储。**
+**八张表，四轨统一存储。**
 
 | 表 | 作用 | 关键字段 |
 | --- | --- | --- |
 | `utterance` | 原文层（**不可再生**） | `id`、`scope_type`/`scope_key`、`session_id`、`speaker_id`、`role`、`text`、`created_at` |
 | `memory_item` | 记忆条目层（四轨统一表） | `id`、`kind`、`scope_type`/`scope_key`、`text`、`payload` JSON、`importance`、`confidence`、`status`、`supersedes_id`、`pinned`、`access_count`、`last_accessed_at`、`created_at`、`updated_at` |
-| `memory_vector` | 向量（独立表） | `item_id` PK、`dim`、`vec` BLOB(float32)、`model` |
-| `entity` / `entity_alias` / `memory_entity` | 实体与关系 | `canonical_name`、`kind`、`alias`、`memory_id` |
+| `memory_vector` | 向量 | `item_id` PK、`dim`、`vec` BLOB(float32)、`model` |
+| `entity` | 实体（消解后的规范化节点） | `id`、`scope_type`/`scope_key`、`canonical_name`、`kind` |
+| `entity_alias` | 别名 → 实体 | `entity_id`、`alias` |
+| `memory_entity` | 记忆 ↔ 实体 | `memory_id`、`entity_id` |
+| `memory_relation` | **记忆 ↔ 记忆 关系** | `from_memory_id`、`to_memory_id`、`relation_type`、`confidence`、`created_at` |
 | `memory_provenance` | 来源指针 | `memory_id`、`utterance_id`、`extractor_version`、`created_at` |
 
 **枚举取值**
@@ -94,8 +101,9 @@ guiyi/
 - `kind`：`episodic` / `semantic` / `emotional` / `procedural`
 - `scope_type`：`personal` / `group` / `self`；`scope_key` 分别为 QQ 号 / 群号 / 字面量 `'self'`
 - `status`：`active` / `superseded` / `archived`
+- `relation_type`：`semantic` / `temporal` / `causal` / `entity`（见下方决策 4）
 
-**三个关键决策**
+**四个关键决策**
 
 1. **四轨单表**。检索是核心路径——单表让"跨类型召回 + 统一 RRF 重排 + 一份向量索引"变简单。类型差异用 `payload` JSON 承载：
    - 语义：`subject` / `predicate` / `object`
@@ -103,12 +111,15 @@ guiyi/
    - 程序性：`style` / `trait`
    - 情景：`event_time` / `participants`
 2. **矛盾更新用链**。新事实把旧事实置 `status=superseded` 并用 `supersedes_id` 串联，历史保留。
-3. **实体 v1 写入但不检索**。v2 开图时不必回填历史；`entity_alias` 从第一天存在，正是实体消解的基础。
+3. **实体与关系 v1 只写入、不检索**。v2/v3 开图时不必回填历史；`entity_alias` 从第一天就存在，正是实体消解的基础。
+4. **关系分四类，其中"因果"必须从第一天有**。借 Jev-Mem 的多关系记忆空间思路，`relation_type` 取 `semantic` / `temporal` / `causal` / `entity`。v1 不检索关系，但**因果链无法事后回填**——"因为那天我说了那句话，她后来就很难过"这类记忆，只能靠当时就把关系记下来。
 
 **索引**
 
 - `(scope_type, scope_key, kind, status)`——覆盖检索主要过滤组合
 - `(supersedes_id)`——冲突链查询
+- `(from_memory_id)` 与 `(to_memory_id, relation_type)`——关系遍历（v3 图检索用）
+- `entity_alias.alias`、`memory_entity.memory_id`——实体消解与反查
 - `memory_vector.item_id` 主键
 
 **约定**
@@ -127,7 +138,7 @@ guiyi/
 2. **并发启动抽取**，与回复生成并行，互不等待。
 3. **抽取**：`LlmExtractor` 输入本轮对话，输出四轨候选条目 + 重要度 + 置信度 + 实体。
 4. **归一与去重**：实体先与别名表比对做消解；语义记忆与同作用域已有条目做相似度比对，命中阈值则走 `supersede` 而非新增。
-5. **落库**：`memory_item` + `memory_vector` + `memory_entity` + `memory_provenance`（记 `extractor_version`）。
+5. **落库**：`memory_item` + `memory_vector` + `memory_entity` + `memory_relation` + `memory_provenance`（记 `extractor_version`）。
 6. **失败只记日志**。原文已存，可离线用新模型重跑。
 
 **四轨的写入语义各不相同**，不能一套逻辑套用：
@@ -156,7 +167,7 @@ guiyi/
 | --- | --- | --- |
 | **排序衰减** | 持续 | 只降排序权重，**不丢数据**；`pinned` 与程序性不衰减 |
 | **归档** | 离线巩固 | 长期未访问的低重要度情景记忆置 `archived`，退出检索但可被巩固引用 |
-| **硬删除** | 仅"忘掉我" | 按 scope 级联删除五张表相关行 |
+| **硬删除** | 仅"忘掉我" | 按 scope 级联删除八张表相关行 |
 
 **巩固 `consolidate()`**（离线任务，建议凌晨执行）：把相似情景记忆聚类，提炼成语义记忆（"多次提到加班" → "工作压力大"）；更新情感与关系状态。该步骤需要 LLM，但离线执行，成本与延迟可控。
 
@@ -222,12 +233,13 @@ logger.bind(face=face, fields=fields).log(level, message)
 | 1 | **作用域隔离** | A 的私聊记忆，在群聊上下文的 `recall()` 结果中**查不到**。断言落在**查询结果**上，而非白盒检查 SQL 字符串 |
 | 2 | 矛盾更新 | 先后写入矛盾事实 → `recall()` 只返回新值；旧值可按 id 查到且 `status=superseded` |
 | 3 | 降级路径 | `Embedder` 抛错时 `recall()` 仍返回 BM25 结果并置 `degraded` |
-| 4 | 删除彻底性 | `forget()` 后五张表零残留 |
+| 4 | 删除彻底性 | `forget()` 后八张表零残留 |
 | 5 | 去重幂等 | 同一事实重复抽取两次，不产生两条 `active` 记忆 |
 | 6 | 写入不阻塞 | 抽取失败时，原文仍已落库 |
 | 7 | RRF 融合 | 构造已知排名，断言融合顺序符合预期 |
 | 8 | 作用域缺失 | 不传 `scope` 调 `recall()` → `ScopeError` |
 | 9 | 向量维度校验 | `embed_dim` 与模型输出不符 → `ConfigError` |
+| 10 | `Judge` 协议可替换 | 注入返回固定决策的假 `Judge`，断言门控 / 去重分支按预期走，全程不触网 |
 
 ---
 
@@ -284,7 +296,7 @@ logger.bind(face=face, fields=fields).log(level, message)
 ### 9.2 依赖清单
 
 - 运行时：`pydantic>=2`、`numpy`、`onnxruntime`、`loguru>=0.7`（与本体对齐）
-- 可选（v2）：`sqlite-vec`
+- 可选（v2）：`sqlite-vec`；Jev（走 HTTP 网关调用，无 SDK 依赖，不进 pip 依赖树）
 - 开发：`pytest`、`ruff`、`basedpyright`
 - **明确不引入**：torch、langchain、任何 web 框架、任何向量数据库 SDK
 - Python **pin 到 3.12**（系统 Python 3.14 下 onnxruntime 轮子未必齐）
@@ -302,6 +314,8 @@ logger.bind(face=face, fields=fields).log(level, message)
 | 四轨一次上齐复杂度高 | 实现与调试成本 | 提供**功能开关**，第一版允许先只开 情景 + 语义 |
 | 小 embedding 对专有名词区分度弱 | 检索漏召 | 混合检索中的 BM25 路专门兜底；`entity_alias` 辅助 |
 | 群聊回复全群可见 | 检索漏加 scope 即泄露 | scope 过滤在存储层强制；缺 scope 直接 `ScopeError` |
+| **引入 Jev 做判断**（v2 备选） | ① 官方声明"非英语准确率不一"，中文未验证；② 云端托管且每轮都跑，内容出网面显著扩大；③ 2026-09-15 才发布，API 仍 early access、定价存疑 | v1 用规则/阈值实现 `Judge`；先自测中文一致率再切换；Jev 的概率与置信度写入结构化日志字段以便归因 |
+| **误把时间/算术交给 `Judge`** | Jev 官方明确不能把日期当有序值比较、不做算术与计数，判断会静默出错 | `event_time` 排序、时间关系、`decay_half_life` 衰减计算一律留在 SQL / 代码里，写在 `Judge` 的接口文档中 |
 
 ---
 
@@ -310,7 +324,7 @@ logger.bind(face=face, fields=fields).log(level, message)
 1. 私聊能正确引用 30 天前的用户偏好，且该记忆**在群聊中绝不复述**（隔离回归测试通过）。
 2. 矛盾事实更新后 `recall()` 只返回最新值，历史可追溯。
 3. embedding 不可用时仍能按关键词召回，并显著标记 `degraded`。
-4. `forget()` 后五张表零残留（自动化断言）。
+4. `forget()` 后八张表零残留（自动化断言）。
 5. 10 万条记忆下单次 `recall()` P95 < 100ms（CPU）。
 6. 抽取失败不影响对话，且原文可离线重抽。
 7. 归忆日志出现在本体 `logs/app.log` 中，树形格式与本体一致，且带 `scope` 等业务字段。
@@ -320,13 +334,41 @@ logger.bind(face=face, fields=fields).log(level, message)
 
 ## 十二、分阶段实施建议
 
+### 12.1 阶段划分
+
 | 阶段 | 内容 | 出口条件 |
 | --- | --- | --- |
-| **v1** | SQLite 五表 + 作用域强制 + 混合检索（向量 + BM25）+ 情景/语义两轨 + 并发抽取 + 降级路径 | 验收标准 1–8 通过 |
-| **v2** | 情感与程序性两轨 + 离线巩固 + 实体消解 | 情感状态能稳定更新；聚类提炼不产生明显噪声 |
-| **v3** | 实体图多跳检索 + `sqlite-vec` 向量索引 + Vulkan/llama.cpp 升级 bge-m3 | 图检索在多跳问题上优于混合检索基线 |
+| **v1** | SQLite 八表 + 作用域强制 + 混合检索（向量 + BM25）+ 情景/语义两轨 + 并发抽取 + 降级路径 + 规则版 `Judge` | 验收标准 1–8 通过 |
+| **v2** | 情感与程序性两轨 + 离线巩固 + 实体消解 + `Judge` 切 Jev（可选） | 情感状态能稳定更新；聚类提炼不产生明显噪声 |
+| **v3** | 关系图多跳检索（含因果链）+ `sqlite-vec` 向量索引 + Vulkan/llama.cpp 升级 bge-m3 | 图检索在多跳问题上优于混合检索基线 |
 
 **v1 的取舍**：先把"不串人、不丢数据、能降级"这三件正确性的事做对，再谈能力上限。能力可以后加，正确性一旦出问题就是信任损失。
+
+### 12.2 Jev（System One 模型）的接入位置与边界
+
+**为什么留到 v2**：Jev 由 TypeSafe AI 于 2026-09-15 发布，是"文本进 → 类型化答案（`Choice` / `Score` / `Noul`）+ 校准概率出"的**判断模型**，**完全不生成文本**。它延迟 70–500ms、输入 \$0.042/M token 且输出免费，很适合归忆里的**高频窄判断**。v1 不引入的三个理由：① 官方声明"非英语准确率不一"，中文准确率**必须先自测**；② 云端托管、无本地部署，而 `Judge` 每轮都跑，会显著扩大内容出网面；③ 发布仅两周，API 仍 early access、定价存疑。
+
+**适合交给 `Judge` 的位置**（括号内为原语）：
+
+| 位置 | 原语 | 对应章节 |
+| --- | --- | --- |
+| 写入门控：这条消息值不值得记 | `Noul` | 5.1 第 2 步 |
+| 去重 / 矛盾判定：决定是否 `supersede` | `Choice` | 5.1 第 4 步 |
+| 检索重排打分 | `Score` | 5.2 第 4 步 |
+| 实体消解：两个称呼是否同一实体 | `Noul` | 四 · 实体表 |
+| 情感类别与强度 | `Choice` + `Score` | 四轨 · 情感 |
+| 巩固聚类：两条情景记忆是否该合并 | `Noul` | 5.3 |
+
+**绝对不交给 `Judge` 的位置**
+
+- **生成类**：记忆正文、摘要、巩固提炼——Jev 不生成文本。
+- **时间与算术**：Jev 官方明确**不能把日期当作有序值比较**、不做算术与计数。因此 `event_time` 排序、时间关系、`decay_half_life` 衰减计算**必须留在 SQL / 代码里**。
+- **安全关键判定单独依赖它**：Jev 只给数字不给理由。作用域门控若使用它，必须"高置信度才自动放行 + 规则兜底"。
+- **需要可追溯推理的场景**：出错时无法解释，不利于排查。
+
+**接入方式**：`Judge` 是 `Protocol`，v1 用规则/阈值实现，v2 换 `JevJudge` 即可，上层零改动。Jev 的**概率与置信度必须写入结构化日志字段**（见 6.3），否则线上判断出错完全无法归因。
+
+> 参考：Jev-Mem（UT Dallas，2026-09-21 开源，论文 *Jev-Mem: System-One-Controlled Agentic Memory for Efficient AI Agents*）把记忆组织为"语义 / 时间 / 因果 / 实体"四类关系的多关系空间。本设计采纳其**关系分类**（见四 · 决策 4），但不引入其 Jev 依赖。
 
 ---
 
