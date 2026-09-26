@@ -673,7 +673,7 @@ logger.bind(face=face, fields=fields).log(level, message)
 | --- | --- | --- |
 | **v1** | SQLite **八表**（v2 起十二表，见四）+ 作用域强制 + 混合检索（向量 + BM25）+ 情景/语义两轨 + 并发抽取 + **去重与 `supersede`** + 降级路径 + 规则版 `Judge` + 注入防护 | 验收标准 1–9 通过 |
 | **v2** | 情感与程序性两轨 + 离线巩固 + 实体消解 + `Judge` 切 Jev（可选）—— **已细化设计**，见 `docs/plans/2026-09-26-guiyi-memory-v2-design.md` | 情感状态能稳定更新；聚类提炼不产生明显噪声；验收标准 10–14 通过 |
-| **v3** | 关系图多跳检索（含因果链）+ `sqlite-vec` 向量索引 + Vulkan/llama.cpp 升级 bge-m3 | 图检索在多跳问题上优于混合检索基线 |
+| **v3** | 关系图多跳检索（含因果链）+ `sqlite-vec` 向量索引 + Vulkan/llama.cpp 升级 bge-m3 + **cross-encoder 重排** —— **已细化设计**，见 `docs/plans/2026-09-26-guiyi-memory-v3-design.md` | 图检索在多跳问题上优于混合检索基线；验收标准 17–22 通过 |
 
 **v1 的取舍**：先把"不串人、不丢数据、能降级"这三件正确性的事做对，再谈能力上限。能力可以后加，正确性一旦出问题就是信任损失。
 
