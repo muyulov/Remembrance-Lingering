@@ -1,2 +1,1 @@
-# Remembrance-Lingering
-Aliya-cosmos的记忆系统——归忆
+# Remembrance-Lingering - *归忆*
